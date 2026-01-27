@@ -201,4 +201,5 @@ console.log(`🚀 yt-dlp-api running on port ${port}`)
 serve({
   fetch: app.fetch,
   port,
+  hostname: '0.0.0.0',
 })
