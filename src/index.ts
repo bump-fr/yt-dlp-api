@@ -93,7 +93,8 @@ app.post('/api/channel', async (c) => {
   }
 
   try {
-    const command = `yt-dlp --dump-json --skip-download --no-warnings --playlist-end 0 "${url}"`
+    // Use --playlist-items 1 to get just the first video and extract channel info
+    const command = `yt-dlp --dump-json --skip-download --no-warnings --playlist-items 1 "${url}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 5 * 1024 * 1024,
