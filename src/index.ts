@@ -19,6 +19,68 @@ app.use('/api/*', bearerAuth({ token: API_TOKEN }))
 // Health check
 app.get('/', (c) => c.json({ status: 'ok', service: 'yt-dlp-api' }))
 
+type YtDlpThumbnail = {
+  url?: string
+  width?: number
+  height?: number
+  preference?: number
+  id?: string
+}
+
+/**
+ * Pick a YouTube thumbnail URL from yt-dlp output.
+ *
+ * Priority:
+ * - hqdefault (best compromise for UI)
+ * - mqdefault
+ * - maxresdefault
+ * - data.thumbnail
+ * - best scored from data.thumbnails
+ * - fallback i.ytimg.com with hqdefault
+ */
+function pickThumbnailUrl(data: Record<string, unknown>): string | null {
+  const videoId = typeof data.id === 'string' ? data.id : null
+  const direct = typeof data.thumbnail === 'string' ? data.thumbnail : null
+
+  const thumbnails = (Array.isArray(data.thumbnails) ? data.thumbnails : []) as YtDlpThumbnail[]
+
+  const findByUrl = (re: RegExp): string | null => {
+    for (const t of thumbnails) {
+      if (typeof t?.url === 'string' && re.test(t.url)) return t.url
+    }
+    return null
+  }
+
+  const hq = findByUrl(/hqdefault/i)
+  if (hq) return hq
+
+  const mq = findByUrl(/mqdefault/i)
+  if (mq) return mq
+
+  const maxres = findByUrl(/maxresdefault/i)
+  if (maxres) return maxres
+
+  if (direct) return direct
+
+  const scored = thumbnails
+    .map((t) => {
+      const url = typeof t?.url === 'string' ? t.url : null
+      if (!url) return null
+      const w = typeof t.width === 'number' ? t.width : 0
+      const h = typeof t.height === 'number' ? t.height : 0
+      const preference = typeof t.preference === 'number' ? t.preference : 0
+      const score = w > 0 && h > 0 ? w * h : preference
+      return { url, score }
+    })
+    .filter(Boolean) as Array<{ url: string; score: number }>
+
+  scored.sort((a, b) => b.score - a.score)
+  if (scored[0]?.url) return scored[0].url
+
+  if (videoId) return `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`
+  return null
+}
+
 /**
  * Extract video metadata
  * POST /api/video
@@ -59,6 +121,8 @@ app.post('/api/video', async (c) => {
       publishedAt = `${year}-${month}-${day}`
     }
 
+    const thumbnailUrl = pickThumbnailUrl(data)
+
     return c.json({
       id: data.id,
       title: data.title,
@@ -67,6 +131,7 @@ app.post('/api/video', async (c) => {
       channelId: data.channel_id,
       channelName: data.channel || data.uploader || 'Unknown',
       channelUrl: data.channel_url || data.uploader_url || `https://www.youtube.com/channel/${data.channel_id}`,
+      thumbnailUrl,
       publishedAt,
       viewCount: data.view_count ?? null,
       languageCode: data.language || null,
