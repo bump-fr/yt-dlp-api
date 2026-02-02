@@ -289,6 +289,9 @@ app.post('/api/channel/videos', async (c) => {
     const sinceDateObj = sinceDate ? parseSinceDateToLocalDate(sinceDate) : null
     let filteredOut = 0
     let filteredOutMissingDate = 0
+    let minPublishedAt: string | null = null
+    let maxPublishedAt: string | null = null
+    const sinceDateStr = sinceDateObj && sinceDate ? (sinceDate.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? null) : null
 
     for (const line of lines) {
       try {
@@ -314,9 +317,20 @@ app.post('/api/channel/videos', async (c) => {
           continue
         }
 
+        // Extra safety: date-only string comparison (YYYY-MM-DD) is stable.
+        if (sinceDateStr && publishedAt && publishedAt < sinceDateStr) {
+          filteredOut += 1
+          continue
+        }
+
         if (sinceDateObj && publishedAtDate && publishedAtDate < sinceDateObj) {
           filteredOut += 1
           continue
+        }
+
+        if (publishedAt) {
+          if (!minPublishedAt || publishedAt < minPublishedAt) minPublishedAt = publishedAt
+          if (!maxPublishedAt || publishedAt > maxPublishedAt) maxPublishedAt = publishedAt
         }
 
         videos.push({
@@ -342,6 +356,8 @@ app.post('/api/channel/videos', async (c) => {
         returned: videos.length,
         filteredOut,
         filteredOutMissingDate,
+        minPublishedAt,
+        maxPublishedAt,
       },
     })
   } catch (error) {
