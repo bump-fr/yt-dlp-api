@@ -265,7 +265,11 @@ app.post('/api/channel/videos', async (c) => {
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
     const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
     const dateafterFlag = dateafter ? ` --dateafter "${dateafter}"` : ''
-    const command = `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${dateafterFlag} "${videosUrl}"`
+    // Note: `--flat-playlist` is fast but may omit `upload_date` unless we enable it.
+    // We enable youtubetab:approximate_date so entries include `upload_date`, allowing
+    // both yt-dlp-side filtering (--dateafter) and JS fallback filtering to work.
+    const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
+    const command = `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${extractorArgs}${dateafterFlag} "${videosUrl}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,
@@ -283,6 +287,7 @@ app.post('/api/channel/videos', async (c) => {
     }> = []
 
     const sinceDateObj = sinceDate ? parseSinceDateToLocalDate(sinceDate) : null
+    let filteredOut = 0
 
     for (const line of lines) {
       try {
@@ -301,6 +306,7 @@ app.post('/api/channel/videos', async (c) => {
 
         // Filter by date if specified
         if (sinceDateObj && publishedAtDate && publishedAtDate < sinceDateObj) {
+          filteredOut += 1
           continue
         }
 
@@ -317,7 +323,17 @@ app.post('/api/channel/videos', async (c) => {
       }
     }
 
-    return c.json({ videos })
+    return c.json({
+      videos,
+      meta: {
+        requestedSinceDate: sinceDate ?? null,
+        ytDlpDateafter: dateafter,
+        maxVideos,
+        totalEntries: lines.length,
+        returned: videos.length,
+        filteredOut,
+      },
+    })
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
     console.error('[yt-dlp] Channel videos extraction failed:', err.stderr || err.message)
