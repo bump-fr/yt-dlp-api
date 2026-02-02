@@ -288,6 +288,7 @@ app.post('/api/channel/videos', async (c) => {
 
     const sinceDateObj = sinceDate ? parseSinceDateToLocalDate(sinceDate) : null
     let filteredOut = 0
+    let filteredOutMissingDate = 0
 
     for (const line of lines) {
       try {
@@ -305,6 +306,14 @@ app.post('/api/channel/videos', async (c) => {
         }
 
         // Filter by date if specified
+        // If sinceDate is set but entry has no upload_date, exclude it (conservative).
+        // Otherwise older videos can slip through and only be revealed later when
+        // full metadata is extracted for each video.
+        if (sinceDateObj && !publishedAtDate) {
+          filteredOutMissingDate += 1
+          continue
+        }
+
         if (sinceDateObj && publishedAtDate && publishedAtDate < sinceDateObj) {
           filteredOut += 1
           continue
@@ -332,6 +341,7 @@ app.post('/api/channel/videos', async (c) => {
         totalEntries: lines.length,
         returned: videos.length,
         filteredOut,
+        filteredOutMissingDate,
       },
     })
   } catch (error) {
