@@ -82,6 +82,68 @@ function pickThumbnailUrl(data: Record<string, unknown>): string | null {
 }
 
 /**
+ * Normalize a user-provided sinceDate into a safe yt-dlp --dateafter value.
+ *
+ * We accept:
+ * - YYYY-MM-DD (or ISO strings that start with it) → YYYYMMDD
+ * - YYYYMMDD → YYYYMMDD
+ * - Relative forms: now|today|yesterday[-N{day|week|month|year}(s)]
+ *
+ * Returns null when the value is not recognized/safe (prevents shell injection).
+ */
+function normalizeSinceDateForYtDlpDateafter(input: string): string | null {
+  const s = input.trim()
+  if (!s) return null
+
+  // ISO-ish date-only prefix: YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss...
+  const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (isoPrefix) {
+    const [, y, m, d] = isoPrefix
+    return `${y}${m}${d}`
+  }
+
+  // Already normalized
+  if (/^\d{8}$/.test(s)) return s
+
+  // Relative forms used by yt-dlp for date filters (same as --date/--dateafter docs)
+  const rel = s.match(/^(now|today|yesterday)(?:-([1-9]\d*)(day|week|month|year)s?)?$/)
+  if (rel) {
+    const [, base, n, unit] = rel
+    if (!n || !unit) return base
+    const needsPlural = n !== '1' && !unit.endsWith('s')
+    return `${base}-${n}${needsPlural ? `${unit}s` : unit}`
+  }
+
+  return null
+}
+
+/**
+ * Parse sinceDate into a local midnight Date for JS-side filtering.
+ *
+ * This is intentionally aligned with the publishedAtDate creation below
+ * (new Date(year, monthIndex, day)) to avoid timezone surprises that can
+ * happen when parsing YYYY-MM-DD as UTC.
+ */
+function parseSinceDateToLocalDate(input: string): Date | null {
+  const s = input.trim()
+  if (!s) return null
+
+  const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})/)
+  if (isoPrefix) {
+    const [, y, m, d] = isoPrefix
+    return new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10))
+  }
+
+  const ymd = s.match(/^(\d{4})(\d{2})(\d{2})$/)
+  if (ymd) {
+    const [, y, m, d] = ymd
+    return new Date(parseInt(y, 10), parseInt(m, 10) - 1, parseInt(d, 10))
+  }
+
+  return null
+}
+
+/**
  * Extract video metadata
  * POST /api/video
  * Body: { url: string }
@@ -201,7 +263,9 @@ app.post('/api/channel/videos', async (c) => {
 
   try {
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
-    const command = `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos} "${videosUrl}"`
+    const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
+    const dateafterFlag = dateafter ? ` --dateafter "${dateafter}"` : ''
+    const command = `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${dateafterFlag} "${videosUrl}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,
@@ -218,7 +282,7 @@ app.post('/api/channel/videos', async (c) => {
       duration: number | null
     }> = []
 
-    const sinceDateObj = sinceDate ? new Date(sinceDate) : null
+    const sinceDateObj = sinceDate ? parseSinceDateToLocalDate(sinceDate) : null
 
     for (const line of lines) {
       try {
