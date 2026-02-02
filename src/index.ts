@@ -265,22 +265,25 @@ app.post('/api/channel/videos', async (c) => {
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
     const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
     const dateafterFlag = dateafter ? ` --dateafter "${dateafter}"` : ''
+    // Keep the command resilient: channel feeds can contain unavailable videos.
+    // Without `--ignore-errors`, yt-dlp can exit non-zero and the API would return 500.
+    const commonFlags = ` --ignore-errors --no-abort-on-error`
     // Important:
     // - `--flat-playlist` can yield approximate/mismatched dates (especially with `approximate_date`),
     //   which can let older videos slip through when later extracting full metadata per video.
     // - When `sinceDate` is provided, prefer non-flat extraction so `upload_date` is authoritative
     //   and `--dateafter` works reliably.
     const command = dateafter
-      ? `yt-dlp --skip-download --dump-json --no-warnings --playlist-end ${maxVideos}${dateafterFlag} "${videosUrl}"`
+      ? `yt-dlp --skip-download --dump-json --no-warnings${commonFlags} --playlist-end ${maxVideos}${dateafterFlag} "${videosUrl}"`
       : (() => {
           // Fast path when no date filter is requested.
           const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
-          return `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
+          return `yt-dlp --flat-playlist --dump-json --no-warnings${commonFlags} --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
         })()
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,
-      timeout: 120000,
+      timeout: dateafter ? 240000 : 120000,
     })
 
     const lines = stdout.trim().split('\n').filter(Boolean)
