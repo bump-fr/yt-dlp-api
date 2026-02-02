@@ -265,11 +265,18 @@ app.post('/api/channel/videos', async (c) => {
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
     const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
     const dateafterFlag = dateafter ? ` --dateafter "${dateafter}"` : ''
-    // Note: `--flat-playlist` is fast but may omit `upload_date` unless we enable it.
-    // We enable youtubetab:approximate_date so entries include `upload_date`, allowing
-    // both yt-dlp-side filtering (--dateafter) and JS fallback filtering to work.
-    const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
-    const command = `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${extractorArgs}${dateafterFlag} "${videosUrl}"`
+    // Important:
+    // - `--flat-playlist` can yield approximate/mismatched dates (especially with `approximate_date`),
+    //   which can let older videos slip through when later extracting full metadata per video.
+    // - When `sinceDate` is provided, prefer non-flat extraction so `upload_date` is authoritative
+    //   and `--dateafter` works reliably.
+    const command = dateafter
+      ? `yt-dlp --skip-download --dump-json --no-warnings --playlist-end ${maxVideos}${dateafterFlag} "${videosUrl}"`
+      : (() => {
+          // Fast path when no date filter is requested.
+          const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
+          return `yt-dlp --flat-playlist --dump-json --no-warnings --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
+        })()
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,
