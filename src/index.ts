@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { bearerAuth } from 'hono/bearer-auth'
 import { exec } from 'node:child_process'
+import { writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 
 const execAsync = promisify(exec)
@@ -15,6 +16,51 @@ app.use('/*', cors())
 // Simple bearer token auth
 const API_TOKEN = process.env.YT_DLP_API_TOKEN || 'dev-token'
 app.use('/api/*', bearerAuth({ token: API_TOKEN }))
+
+let cachedCookiesArg: string | null = null
+
+/**
+ * Build a safe yt-dlp cookies flag from env.
+ *
+ * Supported env vars:
+ * - YT_DLP_COOKIES_FILE: absolute path to a cookies.txt file available in the container
+ * - YT_DLP_COOKIES_B64: base64-encoded Netscape cookies.txt content
+ * - YT_DLP_COOKIES: raw Netscape cookies.txt content (multiline)
+ *
+ * IMPORTANT: Never log cookies content.
+ */
+async function getYtDlpCookiesArg(): Promise<string> {
+  if (cachedCookiesArg !== null) return cachedCookiesArg
+
+  const cookiesFile = process.env.YT_DLP_COOKIES_FILE
+  if (cookiesFile) {
+    cachedCookiesArg = ` --cookies "${cookiesFile}"`
+    return cachedCookiesArg
+  }
+
+  const cookiesB64 = process.env.YT_DLP_COOKIES_B64
+  const cookiesRaw = process.env.YT_DLP_COOKIES
+
+  const cookiesContent =
+    typeof cookiesB64 === 'string' && cookiesB64.trim()
+      ? Buffer.from(cookiesB64.trim(), 'base64').toString('utf8')
+      : cookiesRaw
+
+  if (!cookiesContent || !cookiesContent.trim()) {
+    cachedCookiesArg = ''
+    return cachedCookiesArg
+  }
+
+  // Write cookies to a temp file (Railway containers have a writable /tmp).
+  const cookiesPath = '/tmp/yt-dlp-cookies.txt'
+  await writeFile(cookiesPath, cookiesContent, { encoding: 'utf8', mode: 0o600 })
+  cachedCookiesArg = ` --cookies "${cookiesPath}"`
+  return cachedCookiesArg
+}
+
+function getYtDlpVerboseArg(): string {
+  return process.env.YT_DLP_VERBOSE === '1' ? ' --verbose' : ''
+}
 
 // Health check
 app.get('/', (c) => c.json({ status: 'ok', service: 'yt-dlp-api' }))
@@ -156,7 +202,9 @@ app.post('/api/video', async (c) => {
   }
 
   try {
-    const command = `yt-dlp --dump-json --skip-download --no-warnings --write-comments --extractor-args "youtube:comment_sort=top;max_comments=5" "${url}"`
+    const cookiesArg = await getYtDlpCookiesArg()
+    const verboseArg = getYtDlpVerboseArg()
+    const command = `yt-dlp --dump-json --skip-download --no-warnings${verboseArg}${cookiesArg} --write-comments --extractor-args "youtube:comment_sort=top;max_comments=5" "${url}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 10 * 1024 * 1024,
@@ -221,7 +269,9 @@ app.post('/api/channel', async (c) => {
 
   try {
     // Use --playlist-items 1 to get just the first video and extract channel info
-    const command = `yt-dlp --dump-json --skip-download --no-warnings --playlist-items 1 "${url}"`
+    const cookiesArg = await getYtDlpCookiesArg()
+    const verboseArg = getYtDlpVerboseArg()
+    const command = `yt-dlp --dump-json --skip-download --no-warnings${verboseArg}${cookiesArg} --playlist-items 1 "${url}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 5 * 1024 * 1024,
@@ -264,13 +314,15 @@ app.post('/api/channel/videos', async (c) => {
   try {
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
     const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
+    const cookiesArg = await getYtDlpCookiesArg()
+    const verboseArg = getYtDlpVerboseArg()
     // Keep the command resilient: channel feeds can contain unavailable videos.
     // Without `--ignore-errors`, yt-dlp can exit non-zero and the API would return 500.
     const commonFlags = ` --ignore-errors --no-abort-on-error`
     // Use flat playlist mode for speed and to reduce the chance of triggering YouTube anti-bot checks.
     // We still accept `sinceDate` and apply it in our own filtering logic below.
     const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
-    const command = `yt-dlp --flat-playlist --dump-json --no-warnings${commonFlags} --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
+    const command = `yt-dlp --flat-playlist --dump-json --no-warnings${verboseArg}${cookiesArg}${commonFlags} --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,

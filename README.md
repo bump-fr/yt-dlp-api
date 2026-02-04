@@ -33,8 +33,18 @@ npm run dev
 3. Définir les variables d'environnement :
    - `PORT=3001`
    - `YT_DLP_API_TOKEN=<ton-token-secret>`
+   - (optionnel mais souvent nécessaire) cookies YouTube pour éviter le blocage anti-bot :
+     - `YT_DLP_COOKIES_B64=<base64_du_fichier_cookies_txt>`
+     - ou `YT_DLP_COOKIES=<contenu_multiligne_du_fichier_cookies_txt>`
+     - ou `YT_DLP_COOKIES_FILE=/path/dans_le_container` (si tu montes un fichier)
+   - (optionnel) `YT_DLP_VERBOSE=1` pour des logs yt-dlp très détaillés
 4. Railway détecte automatiquement le Dockerfile
 
+### Notes cookies (anti-bot YouTube)
+
+Si tu vois une erreur du type “Sign in to confirm you’re not a bot”, il faut fournir des cookies à `yt-dlp`.
+
+- **Exporter les cookies** depuis ton navigateur (format Netscape `cookies.txt`) en étant connecté à YouTube.\n- **Ne jamais commit** le fichier cookies.\n- Sur Railway, le plus simple est de mettre le contenu en base64 dans `YT_DLP_COOKIES_B64`.\n
 ## Déploiement Render
 
 1. Créer un nouveau Web Service sur [Render](https://render.com)
