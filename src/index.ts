@@ -18,6 +18,7 @@ const API_TOKEN = process.env.YT_DLP_API_TOKEN || 'dev-token'
 app.use('/api/*', bearerAuth({ token: API_TOKEN }))
 
 let cachedCookiesArg: string | null = null
+let cachedCookiesSource: 'file' | 'b64' | 'raw' | 'none' | null = null
 
 /**
  * Build a safe yt-dlp cookies flag from env.
@@ -35,6 +36,7 @@ async function getYtDlpCookiesArg(): Promise<string> {
   const cookiesFile = process.env.YT_DLP_COOKIES_FILE
   if (cookiesFile) {
     cachedCookiesArg = ` --cookies "${cookiesFile}"`
+    cachedCookiesSource = 'file'
     return cachedCookiesArg
   }
 
@@ -43,11 +45,12 @@ async function getYtDlpCookiesArg(): Promise<string> {
 
   const cookiesContent =
     typeof cookiesB64 === 'string' && cookiesB64.trim()
-      ? Buffer.from(cookiesB64.trim(), 'base64').toString('utf8')
+      ? Buffer.from(cookiesB64.replace(/\s+/g, ''), 'base64').toString('utf8')
       : cookiesRaw
 
   if (!cookiesContent || !cookiesContent.trim()) {
     cachedCookiesArg = ''
+    cachedCookiesSource = 'none'
     return cachedCookiesArg
   }
 
@@ -55,6 +58,7 @@ async function getYtDlpCookiesArg(): Promise<string> {
   const cookiesPath = '/tmp/yt-dlp-cookies.txt'
   await writeFile(cookiesPath, cookiesContent, { encoding: 'utf8', mode: 0o600 })
   cachedCookiesArg = ` --cookies "${cookiesPath}"`
+  cachedCookiesSource = typeof cookiesB64 === 'string' && cookiesB64.trim() ? 'b64' : 'raw'
   return cachedCookiesArg
 }
 
@@ -62,8 +66,28 @@ function getYtDlpVerboseArg(): string {
   return process.env.YT_DLP_VERBOSE === '1' ? ' --verbose' : ''
 }
 
+function getCookiesConfig(): { enabled: boolean; source: 'file' | 'b64' | 'raw' | 'none' } {
+  const cookiesFile = process.env.YT_DLP_COOKIES_FILE
+  if (cookiesFile) return { enabled: true, source: 'file' }
+  const cookiesB64 = process.env.YT_DLP_COOKIES_B64
+  if (typeof cookiesB64 === 'string' && cookiesB64.trim()) return { enabled: true, source: 'b64' }
+  const cookiesRaw = process.env.YT_DLP_COOKIES
+  if (typeof cookiesRaw === 'string' && cookiesRaw.trim()) return { enabled: true, source: 'raw' }
+  return { enabled: false, source: 'none' }
+}
+
 // Health check
-app.get('/', (c) => c.json({ status: 'ok', service: 'yt-dlp-api' }))
+app.get('/', (c) =>
+  c.json({
+    status: 'ok',
+    service: 'yt-dlp-api',
+    ytDlp: {
+      cookiesEnabled: getCookiesConfig().enabled,
+      cookiesSource: getCookiesConfig().source,
+      verbose: process.env.YT_DLP_VERBOSE === '1',
+    },
+  })
+)
 
 type YtDlpThumbnail = {
   url?: string
@@ -251,7 +275,18 @@ app.post('/api/video', async (c) => {
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
     console.error('[yt-dlp] Video extraction failed:', err.stderr || err.message)
-    return c.json({ error: 'Failed to extract video metadata', details: err.stderr || err.message }, 500)
+    return c.json(
+      {
+        error: 'Failed to extract video metadata',
+        details: err.stderr || err.message,
+        ytDlp: {
+          cookiesEnabled: getCookiesConfig().enabled,
+          cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
+          verbose: process.env.YT_DLP_VERBOSE === '1',
+        },
+      },
+      500
+    )
   }
 })
 
@@ -291,7 +326,18 @@ app.post('/api/channel', async (c) => {
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
     console.error('[yt-dlp] Channel extraction failed:', err.stderr || err.message)
-    return c.json({ error: 'Failed to extract channel metadata', details: err.stderr || err.message }, 500)
+    return c.json(
+      {
+        error: 'Failed to extract channel metadata',
+        details: err.stderr || err.message,
+        ytDlp: {
+          cookiesEnabled: getCookiesConfig().enabled,
+          cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
+          verbose: process.env.YT_DLP_VERBOSE === '1',
+        },
+      },
+      500
+    )
   }
 })
 
@@ -416,7 +462,18 @@ app.post('/api/channel/videos', async (c) => {
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
     console.error('[yt-dlp] Channel videos extraction failed:', err.stderr || err.message)
-    return c.json({ error: 'Failed to extract channel videos', details: err.stderr || err.message }, 500)
+    return c.json(
+      {
+        error: 'Failed to extract channel videos',
+        details: err.stderr || err.message,
+        ytDlp: {
+          cookiesEnabled: getCookiesConfig().enabled,
+          cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
+          verbose: process.env.YT_DLP_VERBOSE === '1',
+        },
+      },
+      500
+    )
   }
 })
 
