@@ -66,14 +66,25 @@ function getYtDlpVerboseArg(): string {
   return process.env.YT_DLP_VERBOSE === '1' ? ' --verbose' : ''
 }
 
-function getCookiesConfig(): { enabled: boolean; source: 'file' | 'b64' | 'raw' | 'none' } {
+function getCookiesConfig(): {
+  enabled: boolean
+  source: 'file' | 'b64' | 'raw' | 'none'
+  fileSet: boolean
+  b64Length: number
+  rawLength: number
+} {
   const cookiesFile = process.env.YT_DLP_COOKIES_FILE
-  if (cookiesFile) return { enabled: true, source: 'file' }
   const cookiesB64 = process.env.YT_DLP_COOKIES_B64
-  if (typeof cookiesB64 === 'string' && cookiesB64.trim()) return { enabled: true, source: 'b64' }
   const cookiesRaw = process.env.YT_DLP_COOKIES
-  if (typeof cookiesRaw === 'string' && cookiesRaw.trim()) return { enabled: true, source: 'raw' }
-  return { enabled: false, source: 'none' }
+
+  const fileSet = typeof cookiesFile === 'string' && cookiesFile.trim().length > 0
+  const b64Length = typeof cookiesB64 === 'string' ? cookiesB64.trim().length : 0
+  const rawLength = typeof cookiesRaw === 'string' ? cookiesRaw.trim().length : 0
+
+  if (fileSet) return { enabled: true, source: 'file', fileSet, b64Length, rawLength }
+  if (b64Length > 0) return { enabled: true, source: 'b64', fileSet, b64Length, rawLength }
+  if (rawLength > 0) return { enabled: true, source: 'raw', fileSet, b64Length, rawLength }
+  return { enabled: false, source: 'none', fileSet, b64Length, rawLength }
 }
 
 // Health check
@@ -84,10 +95,24 @@ app.get('/', (c) =>
     ytDlp: {
       cookiesEnabled: getCookiesConfig().enabled,
       cookiesSource: getCookiesConfig().source,
+      cookiesFileSet: getCookiesConfig().fileSet,
+      cookiesB64Length: getCookiesConfig().b64Length,
+      cookiesRawLength: getCookiesConfig().rawLength,
       verbose: process.env.YT_DLP_VERBOSE === '1',
     },
   })
 )
+
+// Startup diagnostics (safe: lengths only, never the cookie content).
+const cfg = getCookiesConfig()
+console.log('[yt-dlp-api] cookies config:', {
+  enabled: cfg.enabled,
+  source: cfg.source,
+  fileSet: cfg.fileSet,
+  b64Length: cfg.b64Length,
+  rawLength: cfg.rawLength,
+  verbose: process.env.YT_DLP_VERBOSE === '1',
+})
 
 type YtDlpThumbnail = {
   url?: string
