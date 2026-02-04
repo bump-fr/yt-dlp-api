@@ -328,25 +328,34 @@ app.post('/api/channel', async (c) => {
   }
 
   try {
-    // Use --playlist-items 1 to get just the first video and extract channel info
     const cookiesArg = await getYtDlpCookiesArg()
     const verboseArg = getYtDlpVerboseArg()
-    const command = `yt-dlp --dump-json --skip-download --no-warnings${verboseArg}${cookiesArg} --playlist-items 1 "${url}"`
+    // Prefer the /about tab and flat playlist mode to avoid video format checks.
+    // Some channels have a first video that triggers "Requested format is not available"
+    // even though we only need channel-level metadata.
+    const normalizedUrl = url.replace(/\/+$/, '')
+    const aboutUrl = normalizedUrl.endsWith('/about') ? normalizedUrl : `${normalizedUrl}/about`
+    const commonFlags = ` --ignore-errors --no-abort-on-error --flat-playlist --playlist-end 1`
+    const command = `yt-dlp --dump-single-json --skip-download --no-warnings${verboseArg}${cookiesArg}${commonFlags} "${aboutUrl}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 5 * 1024 * 1024,
       timeout: 30000,
     })
 
-    const data = JSON.parse(stdout)
+    // yt-dlp should output a single JSON object with --dump-single-json.
+    // Still be resilient to trailing newlines or unexpected multi-line output.
+    const raw = stdout.trim()
+    const firstLine = raw.includes('\n') ? raw.split('\n').find(Boolean) ?? raw : raw
+    const data = JSON.parse(firstLine)
 
     return c.json({
-      id: data.channel_id || data.id,
+      id: data.channel_id || data.uploader_id || data.id,
       name: data.channel || data.uploader || data.title || 'Unknown',
-      url: data.channel_url || data.uploader_url || url,
+      url: data.channel_url || data.uploader_url || data.webpage_url || url,
       description: data.description || null,
-      subscriberCount: data.channel_follower_count ?? null,
-      videoCount: data.playlist_count ?? null,
+      subscriberCount: data.channel_follower_count ?? data.subscriber_count ?? null,
+      videoCount: data.playlist_count ?? data.video_count ?? null,
     })
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
