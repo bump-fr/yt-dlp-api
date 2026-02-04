@@ -253,7 +253,11 @@ app.post('/api/video', async (c) => {
   try {
     const cookiesArg = await getYtDlpCookiesArg()
     const verboseArg = getYtDlpVerboseArg()
-    const command = `yt-dlp --dump-json --skip-download --no-warnings${verboseArg}${cookiesArg} --write-comments --extractor-args "youtube:comment_sort=top;max_comments=5" "${url}"`
+    // Some YouTube responses can expose only "unplayable"/DRM formats depending on region/IP/account,
+    // which may cause yt-dlp to fail format selection even when we only want metadata.
+    // These flags make metadata extraction more resilient.
+    const resilientFlags = ` --allow-unplayable-formats --ignore-no-formats-error --no-playlist`
+    const command = `yt-dlp --dump-json --skip-download --no-warnings${verboseArg}${cookiesArg}${resilientFlags} --write-comments --extractor-args "youtube:comment_sort=top;max_comments=5" "${url}"`
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 10 * 1024 * 1024,
