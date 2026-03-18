@@ -2,7 +2,7 @@ import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { bearerAuth } from 'hono/bearer-auth'
-import { exec } from 'node:child_process'
+import { exec, spawn } from 'node:child_process'
 import { writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 
@@ -288,6 +288,194 @@ function parseSinceDateToLocalDate(input: string): Date | null {
   return null
 }
 
+type ChannelMetadataResponse = {
+  id: string
+  name: string
+  url: string
+  description: string | null
+  subscriberCount: number | null
+}
+
+type ChannelCountMethod = 'probe' | 'enumeration'
+
+type ChannelCountResponse = {
+  count: number | null
+  method: ChannelCountMethod
+  usedFallback: boolean
+  probeCount: number | null
+}
+
+/**
+ * Normalize a channel URL once so all channel endpoints target the same canonical tabs.
+ */
+function normalizeChannelUrl(url: string): string {
+  return url.replace(/\/+$/, '')
+}
+
+/**
+ * Build a channel tab URL from a canonical channel URL.
+ */
+function buildChannelTabUrl(url: string, tab: 'about' | 'videos'): string {
+  const normalizedUrl = normalizeChannelUrl(url)
+  return normalizedUrl.endsWith(`/${tab}`) ? normalizedUrl : `${normalizedUrl}/${tab}`
+}
+
+/**
+ * Safely parse a count-like field from yt-dlp output.
+ */
+function toFiniteCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * Parse the first non-empty JSON line from a yt-dlp stdout payload.
+ */
+function parseFirstJsonObject(stdout: string): Record<string, unknown> {
+  const raw = stdout.trim()
+  const firstLine = raw.includes('\n') ? raw.split('\n').find(Boolean) ?? raw : raw
+  return JSON.parse(firstLine) as Record<string, unknown>
+}
+
+/**
+ * Extract channel metadata from the /about tab without relying on it for video counts.
+ */
+async function extractChannelMetadataFromAbout(params: {
+  url: string
+  cookiesArg: string
+  verboseArg: string
+}): Promise<ChannelMetadataResponse> {
+  const aboutUrl = buildChannelTabUrl(params.url, 'about')
+  const commonFlags = ` --ignore-errors --no-abort-on-error --flat-playlist --playlist-end 1`
+  const command = `yt-dlp --dump-single-json --skip-download --no-warnings${params.verboseArg}${params.cookiesArg}${commonFlags} "${aboutUrl}"`
+
+  const { stdout } = await execAsync(command, {
+    maxBuffer: 5 * 1024 * 1024,
+    timeout: 30000,
+  })
+
+  const data = parseFirstJsonObject(stdout)
+
+  return {
+    id: (data.channel_id as string) || (data.uploader_id as string) || (data.id as string),
+    name: (data.channel as string) || (data.uploader as string) || (data.title as string) || 'Unknown',
+    url: (data.channel_url as string) || (data.uploader_url as string) || (data.webpage_url as string) || params.url,
+    description: (data.description as string) || null,
+    subscriberCount: toFiniteCount(data.channel_follower_count) ?? toFiniteCount(data.subscriber_count),
+  }
+}
+
+/**
+ * Probe the /videos tab for a fast count without enumerating the full channel.
+ */
+async function probeChannelCount(params: {
+  url: string
+  cookiesArg: string
+  verboseArg: string
+}): Promise<number | null> {
+  const videosUrl = buildChannelTabUrl(params.url, 'videos')
+  const commonFlags = ` --ignore-errors --no-abort-on-error --flat-playlist --playlist-end 1`
+  const command = `yt-dlp --dump-single-json --skip-download --no-warnings${params.verboseArg}${params.cookiesArg}${commonFlags} "${videosUrl}"`
+
+  const { stdout } = await execAsync(command, {
+    maxBuffer: 5 * 1024 * 1024,
+    timeout: 30000,
+  })
+
+  const data = parseFirstJsonObject(stdout)
+  return toFiniteCount(data.playlist_count) ?? toFiniteCount(data.video_count)
+}
+
+/**
+ * Enumerate the /videos tab and count parsed entries when the fast probe is suspicious.
+ */
+async function enumerateChannelCount(params: {
+  url: string
+  cookiesArg: string
+  verboseArg: string
+}): Promise<number> {
+  const videosUrl = buildChannelTabUrl(params.url, 'videos')
+  const commonFlags = ` --ignore-errors --no-abort-on-error`
+  const command = `yt-dlp --flat-playlist --dump-json --no-warnings${params.verboseArg}${params.cookiesArg}${commonFlags} "${videosUrl}"`
+
+  return await new Promise<number>((resolve, reject) => {
+    const child = spawn('sh', ['-c', command], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let buffer = ''
+    let count = 0
+    let stderr = ''
+    let settled = false
+    const timeout = setTimeout(() => {
+      settled = true
+      child.kill('SIGKILL')
+      reject(new Error('yt-dlp enumeration timed out after 60000ms'))
+    }, 60000)
+
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk
+      const lines = buffer.split('\n')
+      buffer = lines.pop() ?? ''
+
+      for (const line of lines) {
+        if (line.trim()) count += 1
+      }
+    })
+
+    child.stderr.setEncoding('utf8')
+    child.stderr.on('data', (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-4000)
+    })
+
+    child.on('error', (error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (buffer.trim()) count += 1
+      if (code === 0) {
+        resolve(count)
+        return
+      }
+
+      reject(new Error(`yt-dlp enumeration failed with exit code ${code}: ${summarizeDebugText(stderr) || 'Unknown error'}`))
+    })
+  })
+}
+
+/**
+ * Resolve a channel count using a fast probe first, then a safer fallback when needed.
+ */
+async function resolveChannelCount(params: {
+  url: string
+  cookiesArg: string
+  verboseArg: string
+}): Promise<ChannelCountResponse> {
+  const probeCount = await probeChannelCount(params)
+  if (probeCount !== null && probeCount > 0) {
+    return {
+      count: probeCount,
+      method: 'probe',
+      usedFallback: false,
+      probeCount,
+    }
+  }
+
+  const enumeratedCount = await enumerateChannelCount(params)
+  return {
+    count: enumeratedCount,
+    method: 'enumeration',
+    usedFallback: true,
+    probeCount,
+  }
+}
+
 /**
  * Extract video metadata
  * POST /api/video
@@ -370,6 +558,52 @@ app.post('/api/video', async (c) => {
 })
 
 /**
+ * Resolve a channel video count
+ * POST /api/channel/count
+ * Body: { url: string }
+ */
+app.post('/api/channel/count', async (c) => {
+  const { url } = await c.req.json<{ url: string }>()
+
+  if (!url) {
+    return c.json({ error: 'Missing url parameter' }, 400)
+  }
+
+  try {
+    const cookiesArg = await getYtDlpCookiesArg()
+    const verboseArg = getYtDlpVerboseArg()
+    const result = await resolveChannelCount({ url, cookiesArg, verboseArg })
+    return c.json(result)
+  } catch (error) {
+    const err = error as { message?: string; stderr?: string }
+    const failureCategory = classifyYtDlpFailure(err.stderr || err.message)
+    const stderrSnippet = summarizeDebugText(err.stderr)
+    const messageSnippet = summarizeDebugText(err.message)
+    const ytDlpVersion = await getYtDlpVersion()
+    console.error('[yt-dlp] Channel count failed:', err.stderr || err.message)
+    return c.json(
+      {
+        error: 'Failed to resolve channel count',
+        details: err.stderr || err.message,
+        failureCategory,
+        stderrSnippet,
+        messageSnippet,
+        request: {
+          url,
+        },
+        ytDlp: {
+          version: ytDlpVersion,
+          cookiesEnabled: getCookiesConfig().enabled,
+          cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
+          verbose: process.env.YT_DLP_VERBOSE === '1',
+        },
+      },
+      500
+    )
+  }
+})
+
+/**
  * Extract channel metadata
  * POST /api/channel
  * Body: { url: string }
@@ -382,41 +616,21 @@ app.post('/api/channel', async (c) => {
   }
 
   try {
-    const debugRunId = createDebugRunId('channel')
     const cookiesArg = await getYtDlpCookiesArg()
     const verboseArg = getYtDlpVerboseArg()
-    // Prefer the /about tab and flat playlist mode to avoid video format checks.
-    // Some channels have a first video that triggers "Requested format is not available"
-    // even though we only need channel-level metadata.
-    const normalizedUrl = url.replace(/\/+$/, '')
-    const aboutUrl = normalizedUrl.endsWith('/about') ? normalizedUrl : `${normalizedUrl}/about`
-    const commonFlags = ` --ignore-errors --no-abort-on-error --flat-playlist --playlist-end 1`
-    const command = `yt-dlp --dump-single-json --skip-download --no-warnings${verboseArg}${cookiesArg}${commonFlags} "${aboutUrl}"`
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H2',location:'src/index.ts:377',message:'channel metadata request',data:{url,normalizedUrl,aboutUrl,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,verbose:process.env.YT_DLP_VERBOSE === '1'},timestamp:Date.now()})}).catch(()=>{})
-    // #endregion
+    const metadata = await extractChannelMetadataFromAbout({ url, cookiesArg, verboseArg })
 
-    const { stdout } = await execAsync(command, {
-      maxBuffer: 5 * 1024 * 1024,
-      timeout: 30000,
-    })
-
-    // yt-dlp should output a single JSON object with --dump-single-json.
-    // Still be resilient to trailing newlines or unexpected multi-line output.
-    const raw = stdout.trim()
-    const firstLine = raw.includes('\n') ? raw.split('\n').find(Boolean) ?? raw : raw
-    const data = JSON.parse(firstLine)
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H2',location:'src/index.ts:389',message:'channel metadata success',data:{resolvedId:data.channel_id || data.uploader_id || data.id,hasDescription:Boolean(data.description),subscriberCount:data.channel_follower_count ?? data.subscriber_count ?? null,videoCount:data.playlist_count ?? data.video_count ?? null},timestamp:Date.now()})}).catch(()=>{})
-    // #endregion
+    let videoCount: number | null = null
+    try {
+      const countResult = await resolveChannelCount({ url: metadata.url || url, cookiesArg, verboseArg })
+      videoCount = countResult.count
+    } catch (countError) {
+      console.warn('[yt-dlp] Channel count fallback failed during metadata extraction:', countError)
+    }
 
     return c.json({
-      id: data.channel_id || data.uploader_id || data.id,
-      name: data.channel || data.uploader || data.title || 'Unknown',
-      url: data.channel_url || data.uploader_url || data.webpage_url || url,
-      description: data.description || null,
-      subscriberCount: data.channel_follower_count ?? data.subscriber_count ?? null,
-      videoCount: data.playlist_count ?? data.video_count ?? null,
+      ...metadata,
+      videoCount,
     })
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
@@ -424,9 +638,6 @@ app.post('/api/channel', async (c) => {
     const stderrSnippet = summarizeDebugText(err.stderr)
     const messageSnippet = summarizeDebugText(err.message)
     const ytDlpVersion = await getYtDlpVersion()
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:createDebugRunId('channel-error'),hypothesisId:'H2',location:'src/index.ts:406',message:'channel metadata failure',data:{failureCategory,stderrSnippet,messageSnippet,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,ytDlpVersion},timestamp:Date.now()})}).catch(()=>{})
-    // #endregion
     console.error('[yt-dlp] Channel extraction failed:', err.stderr || err.message)
     return c.json(
       {
@@ -568,7 +779,9 @@ app.post('/api/channel/videos', async (c) => {
         requestedSinceDate: sinceDate ?? null,
         ytDlpDateafter: dateafter,
         maxVideos,
+        // This reflects the fetched /videos entries for this request, not a global channel count.
         totalEntries: lines.length,
+        fetchedEntries: lines.length,
         returned: videos.length,
         filteredOut,
         filteredOutMissingDate,
