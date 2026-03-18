@@ -9,6 +9,7 @@ import { promisify } from 'node:util'
 const execAsync = promisify(exec)
 
 const app = new Hono()
+let cachedYtDlpVersion: Promise<string | null> | null = null
 
 // CORS for your Vercel domain
 app.use('/*', cors())
@@ -87,12 +88,61 @@ function getCookiesConfig(): {
   return { enabled: false, source: 'none', fileSet, b64Length, rawLength }
 }
 
+/**
+ * Build a short per-request identifier for debug correlation.
+ */
+function createDebugRunId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/**
+ * Keep stderr/message payloads compact and safe for debug logs.
+ */
+function summarizeDebugText(value: unknown, maxLength = 280): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  if (!normalized) return null
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized
+}
+
+/**
+ * Classify common yt-dlp failure patterns to validate runtime hypotheses faster.
+ */
+function classifyYtDlpFailure(value: unknown): string {
+  const text = typeof value === 'string' ? value.toLowerCase() : ''
+  if (!text) return 'unknown'
+  if (text.includes(`sign in to confirm you're not a bot`) || text.includes('use --cookies')) return 'bot_check'
+  if (text.includes('membership') || text.includes('private') || text.includes('login required')) return 'auth_required'
+  if (text.includes('channel is not available') || text.includes('this channel does not exist')) return 'channel_unavailable'
+  if (text.includes('unable to recognize tab page') || text.includes('tab') || text.includes('/videos')) return 'tab_resolution'
+  if (text.includes('timed out') || text.includes('timeout')) return 'timeout'
+  if (text.includes('unable to extract') || text.includes('unsupported url') || text.includes('extractor')) return 'extractor_failure'
+  return 'other'
+}
+
+/**
+ * Read and cache the installed yt-dlp version for diagnostics.
+ */
+async function getYtDlpVersion(): Promise<string | null> {
+  if (!cachedYtDlpVersion) {
+    cachedYtDlpVersion = execAsync('yt-dlp --version', {
+      maxBuffer: 1024 * 1024,
+      timeout: 5000,
+    })
+      .then(({ stdout }) => summarizeDebugText(stdout, 64))
+      .catch(() => null)
+  }
+
+  return cachedYtDlpVersion
+}
+
 // Health check
-app.get('/', (c) =>
+app.get('/', async (c) =>
   c.json({
     status: 'ok',
     service: 'yt-dlp-api',
     ytDlp: {
+      version: await getYtDlpVersion(),
       cookiesEnabled: getCookiesConfig().enabled,
       cookiesSource: getCookiesConfig().source,
       cookiesFileSet: getCookiesConfig().fileSet,
@@ -332,6 +382,7 @@ app.post('/api/channel', async (c) => {
   }
 
   try {
+    const debugRunId = createDebugRunId('channel')
     const cookiesArg = await getYtDlpCookiesArg()
     const verboseArg = getYtDlpVerboseArg()
     // Prefer the /about tab and flat playlist mode to avoid video format checks.
@@ -341,6 +392,9 @@ app.post('/api/channel', async (c) => {
     const aboutUrl = normalizedUrl.endsWith('/about') ? normalizedUrl : `${normalizedUrl}/about`
     const commonFlags = ` --ignore-errors --no-abort-on-error --flat-playlist --playlist-end 1`
     const command = `yt-dlp --dump-single-json --skip-download --no-warnings${verboseArg}${cookiesArg}${commonFlags} "${aboutUrl}"`
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H2',location:'src/index.ts:377',message:'channel metadata request',data:{url,normalizedUrl,aboutUrl,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,verbose:process.env.YT_DLP_VERBOSE === '1'},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 5 * 1024 * 1024,
@@ -352,6 +406,9 @@ app.post('/api/channel', async (c) => {
     const raw = stdout.trim()
     const firstLine = raw.includes('\n') ? raw.split('\n').find(Boolean) ?? raw : raw
     const data = JSON.parse(firstLine)
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H2',location:'src/index.ts:389',message:'channel metadata success',data:{resolvedId:data.channel_id || data.uploader_id || data.id,hasDescription:Boolean(data.description),subscriberCount:data.channel_follower_count ?? data.subscriber_count ?? null,videoCount:data.playlist_count ?? data.video_count ?? null},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
 
     return c.json({
       id: data.channel_id || data.uploader_id || data.id,
@@ -363,12 +420,26 @@ app.post('/api/channel', async (c) => {
     })
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
+    const failureCategory = classifyYtDlpFailure(err.stderr || err.message)
+    const stderrSnippet = summarizeDebugText(err.stderr)
+    const messageSnippet = summarizeDebugText(err.message)
+    const ytDlpVersion = await getYtDlpVersion()
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:createDebugRunId('channel-error'),hypothesisId:'H2',location:'src/index.ts:406',message:'channel metadata failure',data:{failureCategory,stderrSnippet,messageSnippet,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,ytDlpVersion},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
     console.error('[yt-dlp] Channel extraction failed:', err.stderr || err.message)
     return c.json(
       {
         error: 'Failed to extract channel metadata',
         details: err.stderr || err.message,
+        failureCategory,
+        stderrSnippet,
+        messageSnippet,
+        request: {
+          url,
+        },
         ytDlp: {
+          version: ytDlpVersion,
           cookiesEnabled: getCookiesConfig().enabled,
           cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
           verbose: process.env.YT_DLP_VERBOSE === '1',
@@ -396,6 +467,7 @@ app.post('/api/channel/videos', async (c) => {
   }
 
   try {
+    const debugRunId = createDebugRunId('channel-videos')
     const videosUrl = url.includes('/videos') ? url : `${url}/videos`
     const dateafter = sinceDate ? normalizeSinceDateForYtDlpDateafter(sinceDate) : null
     const cookiesArg = await getYtDlpCookiesArg()
@@ -407,6 +479,9 @@ app.post('/api/channel/videos', async (c) => {
     // We still accept `sinceDate` and apply it in our own filtering logic below.
     const extractorArgs = ` --extractor-args "youtubetab:approximate_date"`
     const command = `yt-dlp --flat-playlist --dump-json --no-warnings${verboseArg}${cookiesArg}${commonFlags} --playlist-end ${maxVideos}${extractorArgs} "${videosUrl}"`
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H1',location:'src/index.ts:451',message:'channel videos request',data:{url,videosUrl,sinceDate:sinceDate ?? null,dateafter,maxVideos,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,verbose:process.env.YT_DLP_VERBOSE === '1'},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
 
     const { stdout } = await execAsync(command, {
       maxBuffer: 20 * 1024 * 1024,
@@ -483,6 +558,10 @@ app.post('/api/channel/videos', async (c) => {
       }
     }
 
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H3',location:'src/index.ts:530',message:'channel videos success',data:{totalEntries:lines.length,returned:videos.length,filteredOut,filteredOutMissingDate,minPublishedAt,maxPublishedAt,firstVideoId:videos[0]?.id ?? null,lastVideoId:videos.at(-1)?.id ?? null},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
+
     return c.json({
       videos,
       meta: {
@@ -499,12 +578,28 @@ app.post('/api/channel/videos', async (c) => {
     })
   } catch (error) {
     const err = error as { message?: string; stderr?: string }
+    const failureCategory = classifyYtDlpFailure(err.stderr || err.message)
+    const stderrSnippet = summarizeDebugText(err.stderr)
+    const messageSnippet = summarizeDebugText(err.message)
+    const ytDlpVersion = await getYtDlpVersion()
+    // #region agent log
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:createDebugRunId('channel-videos-error'),hypothesisId:'H1',location:'src/index.ts:547',message:'channel videos failure',data:{failureCategory,stderrSnippet,messageSnippet,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,ytDlpVersion},timestamp:Date.now()})}).catch(()=>{})
+    // #endregion
     console.error('[yt-dlp] Channel videos extraction failed:', err.stderr || err.message)
     return c.json(
       {
         error: 'Failed to extract channel videos',
         details: err.stderr || err.message,
+        failureCategory,
+        stderrSnippet,
+        messageSnippet,
+        request: {
+          url,
+          sinceDate: sinceDate ?? null,
+          maxVideos,
+        },
         ytDlp: {
+          version: ytDlpVersion,
           cookiesEnabled: getCookiesConfig().enabled,
           cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
           verbose: process.env.YT_DLP_VERBOSE === '1',
