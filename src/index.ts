@@ -10,6 +10,12 @@ const execAsync = promisify(exec)
 
 const app = new Hono()
 let cachedYtDlpVersion: Promise<string | null> | null = null
+let cachedNodeVersion: Promise<string | null> | null = null
+let cachedYtDlpRuntimeDiagnostics: Promise<{
+  nodeVersion: string | null
+  pythonModules: Record<string, boolean>
+  impersonateTargetsSample: string[]
+}> | null = null
 
 // CORS for your Vercel domain
 app.use('/*', cors())
@@ -111,6 +117,8 @@ function summarizeDebugText(value: unknown, maxLength = 280): string | null {
 function classifyYtDlpFailure(value: unknown): string {
   const text = typeof value === 'string' ? value.toLowerCase() : ''
   if (!text) return 'unknown'
+  if (text.includes('http error 429') || text.includes('too many requests')) return 'rate_limited'
+  if (text.includes('unable to download api page') && text.includes('http error 500')) return 'upstream_api_500'
   if (text.includes(`sign in to confirm you're not a bot`) || text.includes('use --cookies')) return 'bot_check'
   if (text.includes('membership') || text.includes('private') || text.includes('login required')) return 'auth_required'
   if (text.includes('channel is not available') || text.includes('this channel does not exist')) return 'channel_unavailable'
@@ -136,6 +144,70 @@ async function getYtDlpVersion(): Promise<string | null> {
   return cachedYtDlpVersion
 }
 
+/**
+ * Read and cache the available Node.js runtime version.
+ */
+async function getNodeVersion(): Promise<string | null> {
+  if (!cachedNodeVersion) {
+    cachedNodeVersion = execAsync('node -v', {
+      maxBuffer: 1024 * 1024,
+      timeout: 5000,
+    })
+      .then(({ stdout }) => summarizeDebugText(stdout, 64))
+      .catch(() => null)
+  }
+
+  return cachedNodeVersion
+}
+
+/**
+ * Collect compact yt-dlp environment diagnostics based on upstream YouTube guidance.
+ */
+async function getYtDlpRuntimeDiagnostics(): Promise<{
+  nodeVersion: string | null
+  pythonModules: Record<string, boolean>
+  impersonateTargetsSample: string[]
+}> {
+  if (!cachedYtDlpRuntimeDiagnostics) {
+    cachedYtDlpRuntimeDiagnostics = Promise.all([
+      getNodeVersion(),
+      execAsync(
+        `python3 -c "import importlib.util, json; mods=['curl_cffi','brotli','brotlicffi','certifi','requests','websockets']; print(json.dumps({m: bool(importlib.util.find_spec(m)) for m in mods}))"`,
+        {
+          maxBuffer: 1024 * 1024,
+          timeout: 5000,
+        }
+      )
+        .then(({ stdout }) => {
+          try {
+            return JSON.parse(stdout.trim()) as Record<string, boolean>
+          } catch {
+            return {}
+          }
+        })
+        .catch(() => ({})),
+      execAsync('yt-dlp --list-impersonate-targets', {
+        maxBuffer: 1024 * 1024,
+        timeout: 5000,
+      })
+        .then(({ stdout }) =>
+          stdout
+            .split('\n')
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .slice(0, 12)
+        )
+        .catch(() => [] as string[]),
+    ]).then(([nodeVersion, pythonModules, impersonateTargetsSample]) => ({
+      nodeVersion,
+      pythonModules,
+      impersonateTargetsSample,
+    }))
+  }
+
+  return cachedYtDlpRuntimeDiagnostics
+}
+
 // Health check
 app.get('/', async (c) =>
   c.json({
@@ -143,6 +215,7 @@ app.get('/', async (c) =>
     service: 'yt-dlp-api',
     ytDlp: {
       version: await getYtDlpVersion(),
+      runtime: await getYtDlpRuntimeDiagnostics(),
       cookiesEnabled: getCookiesConfig().enabled,
       cookiesSource: getCookiesConfig().source,
       cookiesFileSet: getCookiesConfig().fileSet,
@@ -580,6 +653,7 @@ app.post('/api/channel/count', async (c) => {
     const stderrSnippet = summarizeDebugText(err.stderr)
     const messageSnippet = summarizeDebugText(err.message)
     const ytDlpVersion = await getYtDlpVersion()
+    const runtimeDiagnostics = await getYtDlpRuntimeDiagnostics()
     console.error('[yt-dlp] Channel count failed:', err.stderr || err.message)
     return c.json(
       {
@@ -593,6 +667,7 @@ app.post('/api/channel/count', async (c) => {
         },
         ytDlp: {
           version: ytDlpVersion,
+          runtime: runtimeDiagnostics,
           cookiesEnabled: getCookiesConfig().enabled,
           cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
           verbose: process.env.YT_DLP_VERBOSE === '1',
@@ -638,6 +713,7 @@ app.post('/api/channel', async (c) => {
     const stderrSnippet = summarizeDebugText(err.stderr)
     const messageSnippet = summarizeDebugText(err.message)
     const ytDlpVersion = await getYtDlpVersion()
+    const runtimeDiagnostics = await getYtDlpRuntimeDiagnostics()
     console.error('[yt-dlp] Channel extraction failed:', err.stderr || err.message)
     return c.json(
       {
@@ -651,6 +727,7 @@ app.post('/api/channel', async (c) => {
         },
         ytDlp: {
           version: ytDlpVersion,
+          runtime: runtimeDiagnostics,
           cookiesEnabled: getCookiesConfig().enabled,
           cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
           verbose: process.env.YT_DLP_VERBOSE === '1',
@@ -803,8 +880,9 @@ app.post('/api/channel/videos', async (c) => {
     const stderrSnippet = summarizeDebugText(err.stderr)
     const messageSnippet = summarizeDebugText(err.message)
     const ytDlpVersion = await getYtDlpVersion()
+    const runtimeDiagnostics = await getYtDlpRuntimeDiagnostics()
     // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:createDebugRunId('channel-videos-error'),hypothesisId:'H1',location:'src/index.ts:547',message:'channel videos failure',data:{failureCategory,stderrSnippet,messageSnippet,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,ytDlpVersion},timestamp:Date.now()})}).catch(()=>{})
+    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:createDebugRunId('channel-videos-error'),hypothesisId:'H1',location:'src/index.ts:547',message:'channel videos failure',data:{failureCategory,stderrSnippet,messageSnippet,cookiesEnabled:getCookiesConfig().enabled,cookiesSource:cachedCookiesSource ?? getCookiesConfig().source,ytDlpVersion,runtimeDiagnostics},timestamp:Date.now()})}).catch(()=>{})
     // #endregion
     console.error('[yt-dlp] Channel videos extraction failed:', err.stderr || err.message)
     return c.json(
@@ -821,6 +899,7 @@ app.post('/api/channel/videos', async (c) => {
         },
         ytDlp: {
           version: ytDlpVersion,
+          runtime: runtimeDiagnostics,
           cookiesEnabled: getCookiesConfig().enabled,
           cookiesSource: cachedCookiesSource ?? getCookiesConfig().source,
           verbose: process.env.YT_DLP_VERBOSE === '1',
