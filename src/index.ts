@@ -714,6 +714,9 @@ app.post('/api/channel/videos', async (c) => {
     let filteredOutMissingDate = 0
     let minPublishedAt: string | null = null
     let maxPublishedAt: string | null = null
+    let rawMissingUploadDateCount = 0
+    let rawOlderThanSinceDateCount = 0
+    const rawOlderThanSinceDateSample: Array<{ id: string | null; upload_date: string | null }> = []
     const sinceDateStr = sinceDateObj && sinceDate ? (sinceDate.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? null) : null
 
     for (const line of lines) {
@@ -729,6 +732,15 @@ app.post('/api/channel/videos', async (c) => {
           const day = entry.upload_date.substring(6, 8)
           publishedAt = `${year}-${month}-${day}`
           publishedAtDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day))
+        } else {
+          rawMissingUploadDateCount += 1
+        }
+
+        if (sinceDateStr && publishedAt && publishedAt < sinceDateStr) {
+          rawOlderThanSinceDateCount += 1
+          if (rawOlderThanSinceDateSample.length < 3) {
+            rawOlderThanSinceDateSample.push({ id: entry.id ?? null, upload_date: publishedAt })
+          }
         }
 
         // Filter by date if specified
@@ -768,10 +780,6 @@ app.post('/api/channel/videos', async (c) => {
         continue
       }
     }
-
-    // #region agent log
-    fetch('http://127.0.0.1:7242/ingest/52f648b0-5232-4d77-a7e9-77a4d95956d2',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'181fb7'},body:JSON.stringify({sessionId:'181fb7',runId:debugRunId,hypothesisId:'H3',location:'src/index.ts:530',message:'channel videos success',data:{totalEntries:lines.length,returned:videos.length,filteredOut,filteredOutMissingDate,minPublishedAt,maxPublishedAt,firstVideoId:videos[0]?.id ?? null,lastVideoId:videos.at(-1)?.id ?? null},timestamp:Date.now()})}).catch(()=>{})
-    // #endregion
 
     return c.json({
       videos,
